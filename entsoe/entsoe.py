@@ -16,23 +16,23 @@ from .parsers import parse_prices, parse_loads, parse_generation, \
     parse_installed_capacity_per_plant, parse_crossborder_flows, \
     parse_unavailabilities, parse_contracted_reserve, parse_contracted_reserve_zip, \
     parse_imbalance_prices_zip, parse_imbalance_volumes_zip, parse_netpositions, \
-    parse_procured_balancing_capacity, parse_water_hydro, parse_aggregated_bids, \
+    parse_procured_balancing_capacity_zip, parse_water_hydro, parse_aggregated_bids, \
     parse_activated_balancing_energy_prices, parse_offshore_unavailability, parse_imbalance_volumes
 from .decorators import retry, paginated, year_limited, day_limited, documents_limited
 import warnings
 
 logger = logging.getLogger(__name__)
-warnings.filterwarnings('always')
 warnings.filterwarnings('ignore', category=XMLParsedAsHTMLWarning)
 
 __title__ = "entsoe-py"
-__version__ = "0.7.8"
+__version__ = "0.8.0"
 __author__ = "EnergieID.be, Frank Boerman"
 __license__ = "MIT"
 
 URL = os.getenv("ENTSOE_ENDPOINT_URL") or "https://web-api.tp.entsoe.eu/api"
 
-QUARTER_MTU_SDAC_GOLIVE =  pd.Timestamp('2025-10-01', tz='europe/amsterdam')
+QUARTER_MTU_SDAC_GOLIVE = pd.Timestamp('2025-10-01', tz='Europe/Amsterdam')
+
 
 
 class EntsoeRawClient:
@@ -238,8 +238,8 @@ class EntsoeRawClient:
         -------
         str
         """
-        if process_type not in ['A51', 'A52', 'A47']:
-            raise ValueError('processType allowed values: A51, A52, A47')
+        if process_type not in ['A51', 'A46', 'A47', 'A60', 'A61', 'A67', 'A68']:
+            raise ValueError('processType allowed values: A51, A46, A47, A60, A61, A67, A68')
         area = lookup_area(country_code)
         params = {
             'documentType': 'A24',
@@ -661,7 +661,7 @@ class EntsoeRawClient:
     def query_intraday_offered_capacity(
         self, country_code_from: Union[Area, str],
             country_code_to: Union[Area, str], start: pd.Timestamp,
-            end: pd.Timestamp, implicit:bool = True,**kwargs) -> str:
+            end: pd.Timestamp, implicit:bool = True, id_type:str = 'IDCT', **kwargs) -> str:
         """
         Parameters
         ----------
@@ -670,16 +670,46 @@ class EntsoeRawClient:
         start : pd.Timestamp
         end : pd.Timestamp
         implicit: bool (True = implicit - default for most borders. False = explicit - for instance BE-GB)
+        id_type: intraday trade type, explained below, options are IDCT IDA1 IDA2 IDE3
+
+        explanation from #527 for all the different options for this data:
+
+    implicit = false --> auctionType=A02 --> only valid for borders with ID explicit
+
+    implicit = true + IDType=IDCT --> auctionType = A08 --> ID leftover after SIDC IDCT (or last ATC known by ETP for every MTU during the delivery day - update every 15')
+
+    implicit = true + IDType=IDA1 --> auctionType = A01 + classificationSequence = 1 --> correspond to DA letftover send to xbid at 14:45 for ida1 (core IDCC a)
+
+    implicit = true + IDType=IDA2 --> auctionType = A01 + classificationSequence = 2 --> correspond to iD atc recalculated send to xbid at 21:49 for iDA2 (core IDCC b)
+
+    implicit = true + IDType=IDA3 --> auctionType = A01 + classificationSequence = 3 --> correspond to id atc recalculated send to xbid at 9:40 for ida3 (core IDCC d)
 
         Returns
         -------
         str
         """
+        auction_type = None
+        classification_sequence = None
+        if not implicit:
+            auction_type = 'A02'
+        else:
+            if id_type == 'IDCT':
+                auction_type = 'A08'
+            elif id_type == 'IDA1':
+                auction_type = 'A01'
+                classification_sequence = 1
+            elif id_type == 'IDA2':
+                auction_type = 'A01'
+                classification_sequence = 2
+            elif id_type == 'IDA3':
+                auction_type = 'A01'
+                classification_sequence = 3
         return self._query_crossborder(
             country_code_from=country_code_from,
             country_code_to=country_code_to, start=start, end=end,
             doctype="A31", contract_marketagreement_type="A07",
-            auction_type=("A01" if implicit==True else "A02"))
+            auction_type=auction_type,
+            classification_sequence=classification_sequence)
 
     def query_offered_capacity(
         self, country_code_from: Union[Area, str],
@@ -720,7 +750,10 @@ class EntsoeRawClient:
             country_code_to: Union[Area, str], start: pd.Timestamp,
             end: pd.Timestamp, doctype: str,
             contract_marketagreement_type: Optional[str] = None,
-            auction_type: Optional[str] = None, business_type: Optional[str] = None) -> str:
+            auction_type: Optional[str] = None,
+            business_type: Optional[str] = None,
+            classification_sequence: Optional[int] = None
+            ) -> str:
         """
         Generic function called by query_crossborder_flows,
         query_scheduled_exchanges, query_net_transfer_capacity_DA/WA/MA/YA and query_.
@@ -748,14 +781,13 @@ class EntsoeRawClient:
             'out_Domain': area_out.code
         }
         if contract_marketagreement_type is not None:
-            params[
-                'contract_MarketAgreement.Type'] = contract_marketagreement_type
+            params['contract_MarketAgreement.Type'] = contract_marketagreement_type
         if auction_type is not None:
-            params[
-                'Auction.Type'] = auction_type
+            params['Auction.Type'] = auction_type
         if business_type is not None:
-            params[
-                'businessType'] = business_type
+            params['businessType'] = business_type
+        if classification_sequence is not None:
+            params['ClassificationSequence_AttributeInstanceComponent.Position'] = classification_sequence
 
         response = self._base_request(params=params, start=start, end=end)
         return response.text
@@ -884,7 +916,7 @@ class EntsoeRawClient:
     def query_procured_balancing_capacity(
             self, country_code: Union[Area, str], start: pd.Timestamp,
             end: pd.Timestamp, process_type: str,
-            type_marketagreement_type: Optional[str] = None) -> bytes:
+            type_marketagreement_type: Optional[str] = None, offset: int = 0) -> bytes:
         """
         Parameters
         ----------
@@ -895,6 +927,8 @@ class EntsoeRawClient:
             A51 ... aFRR; A47 ... mFRR
         type_marketagreement_type : str
             type of contract (see mappings.MARKETAGREEMENTTYPE)
+        offset: int
+            offset for querying more than 100 documents
 
         Returns
         -------
@@ -907,7 +941,8 @@ class EntsoeRawClient:
         params = {
             'documentType': 'A15',
             'area_Domain': area.code,
-            'processType': process_type
+            'processType': process_type,
+            "offset": offset,
         }
         if type_marketagreement_type:
             params.update({'type_MarketAgreement.Type': type_marketagreement_type})
@@ -1178,7 +1213,9 @@ class EntsoePandasClient(EntsoeRawClient):
 
         """
         if resolution is not None:
-            warnings.warn('The resolution parameter is deprecated and will be removed. This function will force the right resolution', DeprecationWarning)
+            with warnings.catch_warnings():
+                warnings.simplefilter("always")
+                warnings.warn('The resolution parameter is deprecated and will be removed. This function will force the right resolution', DeprecationWarning)
         area = lookup_area(country_code)
         text = super(EntsoePandasClient, self).query_net_position(
             country_code=area, start=start, end=end, dayahead=dayahead)
@@ -1188,7 +1225,7 @@ class EntsoePandasClient(EntsoeRawClient):
         if dayahead:
             # This function should only return SDAC net positions for day ahead, which have a fixed defined resolution
             # before 2025-10-01 its 60min, after 15min
-            # this is aligned on businessday in timezone europe/amsterdam
+            # this is aligned on businessday in timezone Europe/Amsterdam
             # some zones already publish in different resolution.
             # for secondary auctions published on entsoe, use the query_day_ahead_prices_local function
             if series.index.max() < QUARTER_MTU_SDAC_GOLIVE:
@@ -1253,7 +1290,9 @@ class EntsoePandasClient(EntsoeRawClient):
         pd.Series
         """
         if resolution is not None:
-            warnings.warn('The resolution parameter is deprecated and will be removed. This function will force the right SDAC resolution', DeprecationWarning)
+            with warnings.catch_warnings():
+                warnings.simplefilter("always")
+                warnings.warn('The resolution parameter is deprecated and will be removed. This function will force the right resolution', DeprecationWarning)
         area = lookup_area(country_code)
         # we do here extra days at start and end to fix issue 187
         series = self._query_day_ahead_prices(
@@ -1286,11 +1325,11 @@ class EntsoePandasClient(EntsoeRawClient):
 
         # This function should only return SDAC prices, which have a fixed defined resolution
         # before 2025-10-01 its 60min, after 15min
-        # this is aligned on businessday in timezone europe/amsterdam
+        # this is aligned on businessday in timezone Europe/Amsterdam
         # some zones already publish in different resolution.
         # for secondary auctions published on entsoe, use the query_day_ahead_prices_local function
 
-        series = pd.concat([x for x in series_all.values() if len(x) > 0]).sort_index().tz_convert('europe/amsterdam')
+        series = pd.concat([x for x in series_all.values() if len(x) > 0]).sort_index().tz_convert('Europe/Amsterdam')
         if len(series) == 0:
             raise NoMatchingDataError
         if series.index.max() < QUARTER_MTU_SDAC_GOLIVE:
@@ -1854,7 +1893,9 @@ class EntsoePandasClient(EntsoeRawClient):
     def query_intraday_offered_capacity(
         self, country_code_from: Union[Area, str],
             country_code_to: Union[Area, str], start: pd.Timestamp,
-            end: pd.Timestamp, implicit:bool = True, **kwargs) -> pd.Series:
+            end: pd.Timestamp, implicit:bool = True,
+            id_type:str = 'IDCT',
+            **kwargs) -> pd.Series:
         """
         Note: Result will be in the timezone of the origin country  --> to check
 
@@ -1865,7 +1906,20 @@ class EntsoePandasClient(EntsoeRawClient):
         start : pd.Timestamp
         end : pd.Timestamp
         implicit: bool (True = implicit - default for most borders. False = explicit - for instance BE-GB)
-        Returns
+        id_type: intraday trade type, explained below, options are IDCT IDA1 IDA2 IDE3
+
+        explanation from #527 for all the different options for this data:
+
+    implicit = false --> auctionType=A02 --> only valid for borders with ID explicit
+
+    implicit = true + IDType=IDCT --> auctionType = A08 --> ID leftover after SIDC IDCT (or last ATC known by ETP for every MTU during the delivery day - update every 15')
+
+    implicit = true + IDType=IDA1 --> auctionType = A01 + classificationSequence = 1 --> correspond to DA letftover send to xbid at 14:45 for ida1 (core IDCC a)
+
+    implicit = true + IDType=IDA2 --> auctionType = A01 + classificationSequence = 2 --> correspond to iD atc recalculated send to xbid at 21:49 for iDA2 (core IDCC b)
+
+    implicit = true + IDType=IDA3 --> auctionType = A01 + classificationSequence = 3 --> correspond to id atc recalculated send to xbid at 9:40 for ida3 (core IDCC d)
+
         -------
         pd.Series
         """
@@ -1876,7 +1930,8 @@ class EntsoePandasClient(EntsoeRawClient):
             country_code_to=area_to,
             start=start,
             end=end,
-            implicit=implicit)
+            implicit=implicit,
+            id_type=id_type)
         ts = parse_crossborder_flows(text)
         ts = ts.tz_convert(area_from.tz)
         ts = ts.truncate(before=start, after=end)
@@ -2046,13 +2101,15 @@ class EntsoePandasClient(EntsoeRawClient):
 
     @year_limited
     @paginated
+    @documents_limited(100)
     def query_procured_balancing_capacity(
             self,
             country_code: Union[Area, str],
             process_type: str,
             start: pd.Timestamp,
             end: pd.Timestamp,
-            type_marketagreement_type: Optional[str] = None) -> bytes:
+            type_marketagreement_type: Optional[str] = None,
+            offset: int = 0) -> pd.DataFrame:
         """
         Parameters
         ----------
@@ -2063,16 +2120,20 @@ class EntsoePandasClient(EntsoeRawClient):
         end : pd.Timestamp
         type_marketagreement_type : str
             type of contract (see mappings.MARKETAGREEMENTTYPE)
+        offset: int
+            offset for querying more than 100 documents
 
         Returns
         -------
         pd.DataFrame
         """
         area = lookup_area(country_code)
-        text = super(EntsoePandasClient, self).query_procured_balancing_capacity(
+        zip_contents = super(EntsoePandasClient, self).query_procured_balancing_capacity(
             country_code=area, start=start, end=end,
-            process_type=process_type, type_marketagreement_type=type_marketagreement_type)
-        df = parse_procured_balancing_capacity(text, area.tz)
+            process_type=process_type, type_marketagreement_type=type_marketagreement_type,
+            offset=offset
+        )
+        df = parse_procured_balancing_capacity_zip(zip_contents, area.tz)
         df = df.tz_convert(area.tz)
         df = df.truncate(before=start, after=end)
         return df
